@@ -1,0 +1,96 @@
+
+import streamlit as st
+from backend2 import AdvancedImageFilter
+from PIL import Image
+import os
+from datetime import datetime
+
+# ------------------ Page Config ------------------
+st.set_page_config(page_title="AI Image Filter", layout="wide")
+st.title("📸 AI Image Filter with AND/OR Logic + Date Filter")
+
+# ------------------ Sidebar ------------------
+st.sidebar.header("⚙ Settings")
+model_path = st.sidebar.text_input("YOLO Model Path", "yolov8m-oiv7.pt")
+confidence = st.sidebar.slider("Detection Confidence", 0.0, 1.0, 0.25)
+
+# ------------------ Inputs ------------------
+folder_path = st.text_input("Enter folder path containing images:")
+prompt = st.text_input("Enter prompt (example: 'man and dog' or 'cat or dog')")
+
+use_date_filter = st.radio("Use date filter?", ("No", "Yes")) == "Yes"
+start_dt = end_dt = None
+if use_date_filter:
+    col1, col2 = st.columns(2)
+    with col1:
+        start_dt = st.date_input("Start Date")
+    with col2:
+        end_dt = st.date_input("End Date")
+    start_dt = datetime.combine(start_dt, datetime.min.time())
+    end_dt = datetime.combine(end_dt, datetime.max.time())
+
+# ------------------ Session State ------------------
+if "selected_paths" not in st.session_state:
+    st.session_state.selected_paths = []
+
+if "fif_instance" not in st.session_state:
+    st.session_state.fif_instance = None
+
+results = []
+
+# ------------------ Run Filter ------------------
+if st.button("Run Filter"):
+    if not os.path.exists(folder_path):
+        st.error("❌ Folder not found")
+    elif not prompt.strip():
+        st.error("❌ Please enter a prompt")
+    else:
+        with st.spinner("Processing images..."):
+            fif = AdvancedImageFilter(model_path=model_path, confidence=confidence)
+            results = fif.filter_folder(folder_path, prompt, use_date_filter=use_date_filter)
+            st.session_state.fif_instance = fif
+
+        if results:
+            st.success(f"✅ Found {len(results)} matching images")
+            # Store absolute normalized paths
+            st.session_state.selected_paths = [
+                os.path.normpath(os.path.abspath(img['path'])) for img in results
+            ]
+
+            # Display images in grid
+            cols = st.columns(4)
+            for i, img_info in enumerate(results[:20]):
+                with cols[i % 4]:
+                    try:
+                        img = Image.open(img_info['path'])
+                        objects_list = ", ".join(img_info['objects']) if img_info['objects'] else "None"
+                        img_path_norm = os.path.normpath(os.path.abspath(img_info['path']))
+                        checked = img_path_norm in st.session_state.selected_paths
+
+                        # Checkbox for selection
+                        if st.checkbox(os.path.basename(img_info['path']), value=checked, key=f"chk_{i}"):
+                            if img_path_norm not in st.session_state.selected_paths:
+                                st.session_state.selected_paths.append(img_path_norm)
+                        else:
+                            if img_path_norm in st.session_state.selected_paths:
+                                st.session_state.selected_paths.remove(img_path_norm)
+
+                        st.image(img, caption=f"Objects: {objects_list}", use_column_width=True)
+                    except Exception as e:
+                        st.write(f"Error displaying image: {e}")
+        else:
+            st.warning("No images matched the prompt.")
+
+# ------------------ Export Section ------------------
+dest_folder = st.text_input("Destination folder to copy/move images:")
+move_images = st.checkbox("Move instead of copy")
+
+if st.button("Export Selected Images"):
+    fif = st.session_state.fif_instance
+    if fif is None:
+        st.error("❌ Please run filter first")
+    elif not st.session_state.selected_paths:
+        st.error("❌ No images selected for export")
+    else:
+        count = fif.export_results(dest_folder, selected_images=st.session_state.selected_paths, move=move_images)
+        st.success(f"✅ Exported {count} images to: {dest_folder}")

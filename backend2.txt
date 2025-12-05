@@ -1,0 +1,179 @@
+
+import os
+import shutil
+from datetime import datetime
+from typing import List, Dict, Any, Optional, Tuple
+
+# YOLO
+try:
+    from ultralytics import YOLO
+except ImportError:
+    YOLO = None
+
+# Import your parser
+from newnlp_parser import parse_natural_language
+
+# Helper: extract image datetime
+def extract_image_datetime(image_path: str) -> Optional[datetime]:
+    try:
+        return datetime.fromtimestamp(os.path.getmtime(image_path))
+    except Exception:
+        return None
+
+class AdvancedImageFilter:
+    def __init__(self, model_path: Optional[str] = None, confidence: float = 0.25):
+        self.model_path = model_path or "yolov8m-oiv7.pt"
+        self.confidence = float(confidence)
+        self.model = None
+        self.last_results: List[Dict[str, Any]] = []
+        self._load_model_if_possible()
+
+    def _load_model_if_possible(self):
+        if YOLO is None:
+            self.model = None
+            return
+        if not os.path.exists(self.model_path):
+            raise FileNotFoundError(f"Model weights not found at: {self.model_path}")
+        try:
+            self.model = YOLO(self.model_path)
+            setattr(self.model, "conf", float(self.confidence))
+        except Exception as e:
+            raise RuntimeError(f"Failed to load YOLO model: {e}")
+
+    def detect_image(self, image_path: str) -> Dict[str, Any]:
+        if self.model is None:
+            return {"objects": []}
+        try:
+            results = self.model(image_path, conf=self.confidence, verbose=False)
+            r0 = results[0] if results else None
+            objects = []
+            if r0 and getattr(r0, "boxes", None):
+                for box in r0.boxes:
+                    cls_id = int(getattr(box, "cls", 0))
+                    name = str(cls_id)
+                    if hasattr(self.model, "names"):
+                        try:
+                            name = self.model.names.get(cls_id, str(cls_id)) if isinstance(self.model.names, dict) else self.model.names[cls_id]
+                        except Exception:
+                            pass
+                    objects.append(name.lower())
+            return {"objects": objects}
+        except Exception:
+            return {"objects": []}
+
+    def analyze_prompt(self, prompt: str) -> Dict[str, Any]:
+        parsed = parse_natural_language(prompt) or {}
+        return {
+            "mode": parsed.get("mode", "SINGLE"),
+            "targets": parsed.get("targets", []),
+            "not_groups": parsed.get("not_groups", []),
+            "start_date": parsed.get("start_date"),
+            "end_date": parsed.get("end_date")
+        }
+
+    def _image_matches(
+        self,
+        image_path: str,
+        parsed_prompt: Dict[str, Any],
+        require_date: bool = False
+    ) -> Tuple[bool, List[str]]:
+        img_dt = extract_image_datetime(image_path)
+        if require_date:
+            start_dt = parsed_prompt.get("start_date")
+            end_dt = parsed_prompt.get("end_date")
+            if img_dt is None or (start_dt and img_dt < start_dt) or (end_dt and img_dt > end_dt):
+                return False, []
+
+        targets = parsed_prompt.get("targets", [])
+        not_groups = parsed_prompt.get("not_groups", [])
+        mode = parsed_prompt.get("mode", "SINGLE")
+
+        det_result = self.detect_image(image_path)
+        detected = [d.lower() for d in det_result.get("objects", [])]
+        detected_set = set(detected)
+
+        # NOT groups
+        for ng in not_groups:
+            if any(g.lower() in detected_set for g in ng):
+                return False, detected
+
+        # AND / OR / SINGLE logic
+        if targets:
+            if mode == "AND":
+                for group in targets:
+                    if not any(g.lower() in detected_set for g in group):
+                        return False, detected
+                return True, detected
+            elif mode == "OR":
+                for group in targets:
+                    if any(g.lower() in detected_set for g in group):
+                        return True, detected
+                return False, detected
+            else:  # SINGLE
+                group = targets[0]
+                if any(g.lower() in detected_set for g in group):
+                    return True, detected
+                return False, detected
+        return True, detected
+
+    def filter_folder(
+        self,
+        folder_path: str,
+        prompt: str,
+        use_date_filter: bool = False
+    ) -> List[dict]:
+        parsed_prompt = self.analyze_prompt(prompt)
+        image_extensions = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp')
+        image_files = [f for f in os.listdir(folder_path) if f.lower().endswith(image_extensions)]
+        matching_images = []
+
+        for image_file in image_files:
+            img_path = os.path.join(folder_path, image_file)
+            matched, counts = self._image_matches(img_path, parsed_prompt, require_date=use_date_filter)
+            if matched:
+                matching_images.append({"path": img_path, "objects": counts})
+
+        self.last_results = matching_images
+        return matching_images
+
+    # ---------- Fixed Export ----------
+    def export_results(self, destination_folder: str, selected_images: Optional[List[str]] = None, move: bool = False) -> int:
+        if not self.last_results:
+            print("No images to export.")
+            return 0
+
+        os.makedirs(destination_folder, exist_ok=True)
+
+        # Use absolute paths for matching
+        if selected_images is None:
+            to_export = self.last_results
+        else:
+            selected_set = set(selected_images)  # Already normalized
+            to_export = [r for r in self.last_results if r["path"] in selected_set]
+
+            for r in self.last_results:
+                img_path = os.path.normpath(os.path.abspath(r["path"]))
+                if img_path in selected_set:
+                    to_export.append(r)
+
+        if not to_export:
+            print("No matching images found in last_results for export.")
+            return 0
+
+        count = 0
+        for item in to_export:
+            src = item["path"]
+            dst = os.path.join(destination_folder, os.path.basename(src))
+            try:
+                if move:
+                    shutil.move(src, dst)
+                    print(f"Moved: {src} -> {dst}")
+                else:
+                    shutil.copy2(src, dst)
+                    print(f"Copied: {src} -> {dst}")
+                count += 1
+            except Exception as e:
+                print(f"Failed to copy/move {src}: {e}")
+
+        print(f"Total exported: {count}")
+        return count
